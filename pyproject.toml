@@ -1,0 +1,16 @@
+[project]
+name = "diffusion-examples"
+version = "0.1.0"
+description = "Example library for diffusion modelling"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "rioxarray>=0.19.0",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+]
+
+[tool.setuptools.packages.find]
+where = [
+    "src"
+]

@@ -1,0 +1,1 @@
+An example library for playing around with diffusion models
