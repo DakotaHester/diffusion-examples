@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+logs/
+models/
+outputs/
+s2_naip_pairs*
+dakota_sample_training_sr_images/

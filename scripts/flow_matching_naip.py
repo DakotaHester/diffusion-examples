@@ -26,9 +26,9 @@ import pandas as pd
 def main():
     random.seed(1701)
 
-    s2_files = glob(os.path.join('..', 's2_naip_pairs', 'sentinel2', '*.tif'))
-    lcmap_files = glob(os.path.join('..', 's2_naip_pairs', 'lcmap', '*.tif'))
-    naip_files = glob(os.path.join('..', 's2_naip_pairs', 'naip', '*.tif'))
+    s2_files = glob(os.path.join('..', 's2_naip_pairs_4x', 'sentinel2', '*.tif'))
+    lcmap_files = glob(os.path.join('..', 's2_naip_pairs_4x', 'lcmap', '*.tif'))
+    naip_files = glob(os.path.join('..', 's2_naip_pairs_4x', 'naip', '*.tif'))
 
     s2_ids = [path.split(os.sep)[-1].replace('.tif', '') for path in s2_files]
     lcmap_ids = [path.split(os.sep)[-1].replace('.tif', '') for path in lcmap_files]
@@ -38,10 +38,10 @@ def main():
     val_ids = random.sample(all_ids, k=int(0.1*len(all_ids)))
     train_ids = [idfr for idfr in all_ids if idfr not in val_ids]
 
-    train_dataset = NAIPDataset(os.path.join('..', 's2_naip_pairs'), ids=train_ids)
+    train_dataset = NAIPDataset(os.path.join('..', 's2_naip_pairs_4x'), ids=train_ids)
     print(f'Number of samples in training dataset: {len(train_dataset)}')
 
-    val_dataset = NAIPDataset(os.path.join('..', 's2_naip_pairs'), ids=val_ids)
+    val_dataset = NAIPDataset(os.path.join('..', 's2_naip_pairs_4x'), ids=val_ids)
     print(f'Number of samples in validation dataset: {len(val_dataset)}')
 
     pca_pipeline_path = os.path.join('..', 'models', 'pca_pipeline.joblib')
@@ -60,11 +60,11 @@ def main():
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print(f'Using backed {device}')
     if device.type == 'cuda' and torch.cuda.is_bf16_supported():
-        print('bfloat16 is supported. Using for mixed precision.')
-        mixed_precision_dtype = torch.bfloat16
+        print('Using bfloat16 for mixed precision.')
+        dtype = torch.bfloat16
     else:
-        print('bfloat16 not supported. Falling back to float16 for mixed precision.')
-        mixed_precision_dtype = torch.float16
+        print('Using full precision (float32).')
+        dtype = torch.float32
 
     model = UNet2DModel(
         sample_size=256,
@@ -74,22 +74,29 @@ def main():
         block_out_channels=[64, 128, 256, 512],
         # block_out_channels=[48, 96, 192, 384],
         # block_out_channels=[32, 32, 32, 32],
+        # block_out_channels=[32, 64, 128, 256],
         down_block_types=['DownBlock2D'] * 4, # + ['AttnDownBlock2D'],
         up_block_types=['UpBlock2D'] * 4, # + ['AttnUpBlock2D']
         # norm_num_groups=48,
     )
-    model.to(device)
+    # # Gradient clipping
+    # # See https://stackoverflow.com/a/54816498
+    # clip_value = 1.0
+    # for p in model.parameters():
+    #     p.register_hook(lambda grad: torch.clamp(grad, -clip_value, clip_value))
+    
+    model.to(device, dtype=dtype)
 
-    input = torch.randn(1, 16, 256, 256).to(next(model.parameters()).device)
+    input = torch.randn(1, 16, 256, 256).to(device, dtype=dtype)
     macs, params = profile(model, inputs=(input,0), verbose=False)
     flops = 2 * macs 
     print(f"MACs: {macs:,}, Params: {params:,}, FLOPs: {flops:,}")
 
-    batch_size = 1024
+    batch_size = 256
     micro_batch_size = 32
     n_epochs = 300
     warmup_epochs = 10
-    lr = 1e-3
+    lr = 1e-4
     # loss_lambda = 0.0 # l_total = l_l1 + lambda * l_percep
     grad_accum_steps = batch_size // micro_batch_size
 
@@ -97,9 +104,9 @@ def main():
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs-1)
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs - warmup_epochs)
     lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
-    scaler = GradScaler()
+    # scaler = GradScaler()
     # perceptual_loss = PerceptualLoss(pca_pipeline, device=device)
-    pca_conv = PCAConvLayer(pca_pipeline).to(device)
+    pca_conv = PCAConvLayer(pca_pipeline).to(device, dtype=dtype)
 
     train_dataloader = DataLoader(train_dataset, batch_size=micro_batch_size, shuffle=True, drop_last=True, pin_memory=True, num_workers=4)
     val_dataloader = DataLoader(val_dataset, batch_size=micro_batch_size, shuffle=False, drop_last=False, pin_memory=True, num_workers=4)
@@ -139,10 +146,10 @@ def main():
             with tqdm(loader, desc=f'Epoch {epoch}/{n_epochs} {phase.capitalize() + ('  ' if phase == 'val' else '')}', unit='batch', postfix={'lr': optimizer.param_groups[0]['lr']}) as pbar:
                 for i, (s2_img, lcmap, naip_img) in enumerate(pbar):
                     
-                    s2_img, _, naip_img = s2_img.to(device), lcmap.to(device), naip_img.to(device)
+                    s2_img, _, naip_img = s2_img.to(device, dtype=dtype), lcmap.to(device, dtype=dtype), naip_img.to(device, dtype=dtype)
                     
                     x_0 = torch.randn_like(naip_img) 
-                    t = torch.rand(x_0.shape[0], device=device)
+                    t = torch.rand(x_0.shape[0], device=device, dtype=dtype)
                     t_reshaped = t.view(-1, 1, 1, 1)
                     
                     # interpolated point on the path (linear interpolation)
@@ -150,10 +157,9 @@ def main():
                     target_vector = naip_img - x_0 # target vector field
                     unet_input = torch.cat((x_t, s2_img), dim=1)
 
-                    with autocast(device.type, dtype=mixed_precision_dtype):
-                        pred_vector = model(unet_input, t * 1000).sample
-                        l1_loss = F.l1_loss(pred_vector, target_vector, reduction='none').mean(dim=(1, 2, 3))
-                        # percep_loss = perceptual_loss(pred_vector + x_0, naip_img)
+                    pred_vector = model(unet_input, t * 1000).sample
+                    l1_loss = F.l1_loss(pred_vector, target_vector, reduction='none').mean(dim=(1, 2, 3))
+                    # percep_loss = perceptual_loss(pred_vector + x_0, naip_img)
                         
                     # total_loss = l1_loss + loss_lambda * percep_loss
                     pred_img = (pred_vector + x_0).detach().clamp(-1, 1)
@@ -170,10 +176,12 @@ def main():
 
                     if phase == 'train':
                         # scaler.scale(total_loss.mean()).backward()
-                        scaler.scale(l1_loss.mean()).backward()
+                        # scaler.scale(l1_loss.mean()).backward()
+                        (l1_loss / grad_accum_steps).mean().backward()
                         if (i + 1) % grad_accum_steps == 0:
-                            scaler.step(optimizer)
-                            scaler.update()
+                            # scaler.step(optimizer)
+                            # scaler.update()
+                            optimizer.step()
                             optimizer.zero_grad()
                     
                     pbar_postfix = {'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'}
@@ -186,8 +194,8 @@ def main():
                 epoch_metrics[f'{phase}_{metric}'] /= phase_count
                 metrics[f'{phase}_{metric}'].append(epoch_metrics[f'{phase}_{metric}'])
                     
-        pd.DataFrame(metrics).to_csv('../logs/fm_s2_naip_sr_10x.csv', index=False)
-        torch.save(model.state_dict(), '../models/fm_s2_naip_sr_10x.pt')
+        pd.DataFrame(metrics).to_csv('../logs/fm_s2_naip_sr_4x.csv', index=False)
+        torch.save(model.state_dict(), '../models/fm_s2_naip_sr_4x.pt')
         lr_scheduler.step()
 
 
@@ -438,37 +446,36 @@ class PerceptualLoss(nn.Module):
 def inference(model, s2_img, lcmap, total_steps):
     
     device = model.device
+    dtype = next(model.parameters()).dtype
     timesteps = torch.linspace(0, 1, total_steps, device=device)
     step_size = timesteps[1] - timesteps[0]
     
     naip_shape = list(s2_img.shape)
     naip_shape[1] = 4
-    x = torch.randn(naip_shape, device=device)
+    x = torch.randn(naip_shape, device=device, dtype=dtype)
     for t in tqdm(timesteps):
-        t_batch = torch.ones(s2_img.shape[0], device=device) * t
-        t_mid_batch = torch.ones(s2_img.shape[0], device=device) * (t + step_size / 2)
-        t_next_batch = torch.ones(s2_img.shape[0], device=device) * (t + step_size)
-
-        with torch.no_grad(), autocast(device.type, dtype=mixed_precision_dtype):
+        t_batch = torch.ones(s2_img.shape[0], device=device, dtype=dtype) * t
+        t_mid_batch = torch.ones(s2_img.shape[0], device=device, dtype=dtype) * (t + step_size / 2)
+        t_next_batch = torch.ones(s2_img.shape[0], device=device, dtype=dtype) * (t + step_size)
             
-            # k1: velocity at start of the step
-            model_input_k1 = torch.cat((x, s2_img, lcmap), dim=1)
-            v_k1 = model(model_input_k1, t_batch * 1000).sample
-            
-            # k2: velocity at midpoint
-            x_k2 = x + v_k1 * (step_size / 2)
-            model_input_k2 = torch.cat((x_k2, s2_img, lcmap), dim=1)
-            v_k2 = model(model_input_k2, t_mid_batch * 1000).sample
-            
-            # k3: velocity at midpoint (estimated with k2)
-            x_k3 = x + v_k2 * (step_size / 2)
-            model_input_k3 = torch.cat((x_k3, s2_img, lcmap), dim=1)
-            v_k3 = model(model_input_k3, t_mid_batch * 1000).sample
-            
-            # k4: velocity at the end of the step
-            x_k4 = x + v_k3 * step_size
-            model_input_k4 = torch.cat((x_k4, s2_img, lcmap), dim=1)
-            v_k4 = model(model_input_k4, t_next_batch * 1000).sample
+        # k1: velocity at start of the step
+        model_input_k1 = torch.cat((x, s2_img, lcmap), dim=1)
+        v_k1 = model(model_input_k1, t_batch * 1000).sample
+        
+        # k2: velocity at midpoint
+        x_k2 = x + v_k1 * (step_size / 2)
+        model_input_k2 = torch.cat((x_k2, s2_img, lcmap), dim=1)
+        v_k2 = model(model_input_k2, t_mid_batch * 1000).sample
+        
+        # k3: velocity at midpoint (estimated with k2)
+        x_k3 = x + v_k2 * (step_size / 2)
+        model_input_k3 = torch.cat((x_k3, s2_img, lcmap), dim=1)
+        v_k3 = model(model_input_k3, t_mid_batch * 1000).sample
+        
+        # k4: velocity at the end of the step
+        x_k4 = x + v_k3 * step_size
+        model_input_k4 = torch.cat((x_k4, s2_img, lcmap), dim=1)
+        v_k4 = model(model_input_k4, t_next_batch * 1000).sample
         
         x = x + (step_size / 6) * (v_k1 + 2*v_k2 + 2*v_k3 + v_k4)
     
