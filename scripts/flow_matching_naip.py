@@ -96,7 +96,7 @@ def main():
     micro_batch_size = 32
     n_epochs = 300
     warmup_epochs = 10
-    lr = 1e-4
+    lr = 1e-3
     # loss_lambda = 0.0 # l_total = l_l1 + lambda * l_percep
     grad_accum_steps = batch_size // micro_batch_size
 
@@ -178,6 +178,7 @@ def main():
                         # scaler.scale(total_loss.mean()).backward()
                         # scaler.scale(l1_loss.mean()).backward()
                         (l1_loss / grad_accum_steps).mean().backward()
+                        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         if (i + 1) % grad_accum_steps == 0:
                             # scaler.step(optimizer)
                             # scaler.update()
